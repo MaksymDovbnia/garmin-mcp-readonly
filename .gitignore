@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+
+# Never commit Garmin OAuth tokens, even if someone points GARMINTOKENS here.
+.garminconnect/
+tokens/
+*.token

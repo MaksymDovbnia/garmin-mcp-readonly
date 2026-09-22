@@ -1,0 +1,21 @@
+[project]
+name = "garmin-mcp"
+version = "0.1.0"
+description = "MCP server exposing your own Garmin Connect data to Claude, using token-only auth."
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=2.2,<3",
+    "garminconnect==0.3.16",
+]
+
+[project.scripts]
+garmin-mcp = "garmin_mcp.server:main"
+garmin-mcp-auth = "garmin_mcp.auth:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/garmin_mcp"]
