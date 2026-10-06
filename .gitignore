@@ -1,11 +1,19 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 dist/
 build/
 *.egg-info/
+.env
 
 # Never commit Garmin OAuth tokens, even if someone points GARMINTOKENS here.
+# The token file written by garminconnect is garmin_tokens.json.
 .garminconnect/
 tokens/
 *.token
+garmin_tokens*.json
+.DS_Store
+
+# Article drafts and launch material stay local; the repository is the server only.
+docs/

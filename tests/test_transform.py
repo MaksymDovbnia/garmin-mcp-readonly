@@ -1,12 +1,15 @@
 """Tests for the pure transform layer - no network, no credentials."""
 
+import copy
+import json
 from datetime import date, timedelta
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from garmin_mcp import server
 from garmin_mcp.privacy import scrub
-from garmin_mcp.server import _day, _summarise_activity
+from garmin_mcp.server import _day, _flatten_detail, _summarise_activity
 
 
 class TestDay:
@@ -98,3 +101,89 @@ class TestSummariseActivity:
             {"activityId": 5, "activityType": {"typeKey": "running"}, "distance": 0, "duration": 600.0}
         )
         assert "pace_per_km" not in out and "speed_kmh" not in out
+
+
+# Synthetic payload with the structure Garmin returns for ONE activity (get_activity):
+# metrics under summaryDTO, type under activityTypeDTO. The list endpoint is flat.
+DETAIL = {
+    "activityId": 42,
+    "activityName": "Test Run",
+    "locationName": "Testville",
+    "userProfileId": 999,
+    "activityTypeDTO": {"typeId": 1, "typeKey": "running", "parentTypeId": 17},
+    "eventTypeDTO": {"typeKey": "training"},
+    "metadataDTO": {"lapCount": 5},
+    "summaryDTO": {
+        "startTimeLocal": "2026-01-01T07:00:00.0",
+        "startLatitude": 1.5,
+        "startLongitude": 2.5,
+        "distance": 10000.0,
+        "duration": 3000.0,
+        "elapsedDuration": 3100.0,
+        "calories": 700.0,
+        "averageHR": 150.0,
+        "maxHR": 175.0,
+        "elevationGain": 80.0,
+        "trainingEffect": 3.2,
+        "anaerobicTrainingEffect": 0.5,
+    },
+}
+
+
+class DetailClient:
+    def get_activity(self, activity_id):
+        return copy.deepcopy(DETAIL)
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: {}
+
+
+class TestGetActivityDetail:
+    @pytest.fixture(autouse=True)
+    def _client(self, monkeypatch):
+        monkeypatch.setattr(server, "connect", lambda: DetailClient())
+
+    def test_summary_is_filled_from_the_nested_payload(self):
+        summary = server.get_activity("42")["summary"]
+        assert summary["name"] == "Test Run"
+        assert summary["type"] == "running"
+        assert summary["distance_km"] == 10.0
+        assert summary["duration_min"] == 50.0
+        assert summary["pace_per_km"] == "5:00"
+        assert summary["avg_hr"] == 150.0
+        assert summary["elevation_gain_m"] == 80.0
+        assert summary["training_effect_aerobic"] == 3.2
+        assert summary["location"] == "Testville"
+
+    def test_gps_is_left_out_by_default_and_identifiers_never_appear(self):
+        result = server.get_activity("42")
+        text = json.dumps(result)
+        assert "start_latitude" not in result["summary"]
+        assert "startLatitude" not in text and "userProfileId" not in text
+
+    def test_no_null_coordinates_for_an_activity_without_gps(self, monkeypatch):
+        indoor = copy.deepcopy(DETAIL)
+        for key in ("startLatitude", "startLongitude"):
+            del indoor["summaryDTO"][key]
+
+        class Indoor(DetailClient):
+            def get_activity(self, activity_id):
+                return copy.deepcopy(indoor)
+
+        monkeypatch.setattr(server, "connect", lambda: Indoor())
+        summary = server.get_activity("42", include_location=True)["summary"]
+        assert "start_latitude" not in summary and "start_longitude" not in summary
+
+    def test_gps_can_be_requested(self):
+        summary = server.get_activity("42", include_location=True)["summary"]
+        assert (summary["start_latitude"], summary["start_longitude"]) == (1.5, 2.5)
+
+
+class TestFlattenDetail:
+    def test_flat_list_shaped_payload_is_unchanged(self):
+        flat = {"activityId": 1, "distance": 5.0, "activityType": {"typeKey": "cycling"}}
+        assert _flatten_detail(flat) == flat
+
+    def test_alternate_key_names_are_understood(self):
+        out = _summarise_activity({"averagePower": 200, "normalizedPower": 230, "trainingEffect": 2.0})
+        assert (out["avg_power_w"], out["normalized_power_w"], out["training_effect_aerobic"]) == (200, 230, 2.0)

@@ -12,11 +12,17 @@ Design notes:
 
 from __future__ import annotations
 
+import functools
+import inspect
+import json
+import math
+import re
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from .client import connect
 from .privacy import scrub
@@ -29,6 +35,87 @@ server = MCPServer(
         "Prefer list_activities + get_activity over call_readonly."
     ),
 )
+
+# Every tool here only reads. Say so to the client (read_only_hint) and send each
+# result once as text: with structured output on, typed returns are also emitted
+# as structuredContent, which clients that forward both blocks pay for twice.
+_register = server.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    structured_output=False,
+)
+
+
+# Largest response sent to the model. A raw payload such as an activity's per-second
+# chart data can run to megabytes, which floods the context and trips client limits.
+MAX_RESPONSE_BYTES = 100_000
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _repair(value: Any) -> Any:
+    """Make data from Garmin encodable: NaN/Infinity become null, lone surrogates become U+FFFD.
+
+    Garmin's JSON is external input. A name with half an emoji or one non-finite metric
+    must not fail a whole result. Types JSON cannot hold at all are left alone, so they
+    still raise: that would be a bug here, not bad data.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _LONE_SURROGATE.sub("\ufffd", value)
+    if isinstance(value, dict):
+        return {_repair(k): _repair(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_repair(v) for v in value]
+    return value
+
+
+def _dumps(value: Any) -> tuple[str, int]:
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return text, len(text.encode("utf-8"))
+
+
+def _to_json(value: Any) -> str:
+    """One compact JSON document; oversized results become a notice with a short preview.
+
+    Bad data from Garmin is repaired (see ``_repair``); values JSON cannot represent at
+    all raise, because they mean a bug in this code.
+    """
+    try:
+        text, size = _dumps(value)
+    except ValueError:  # NaN/Infinity, or a lone surrogate failing UTF-8 encoding
+        text, size = _dumps(_repair(value))
+    if size <= MAX_RESPONSE_BYTES:
+        return text
+    notice = {
+        "truncated": True,
+        "total_bytes": size,
+        "limit_bytes": MAX_RESPONSE_BYTES,
+        "hint": "Result too large. Ask for less: a shorter date range, one activity, or a dedicated tool.",
+        "preview": text[:2000],
+    }
+    return json.dumps(notice, separators=(",", ":"), ensure_ascii=False)
+
+
+def read_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register ``fn`` as a read-only tool that answers with ONE compact JSON text block.
+
+    Handing a list or None to the SDK gives one block per element and no block at all
+    for an empty result, which clients treat inconsistently; a single JSON string is
+    unambiguous ("[]" and "null" included). ``fn`` itself is returned unchanged, so it
+    stays directly callable from tests. Sync functions only: the wrapper is sync, so an
+    ``async def`` would be serialised as a coroutine object instead of being awaited.
+    """
+    if inspect.iscoroutinefunction(fn):
+        raise TypeError(f"read_tool wraps sync tools only; {fn.__name__} is async")
+
+    @functools.wraps(fn)
+    def as_json(*args: Any, **kwargs: Any) -> str:
+        return _to_json(fn(*args, **kwargs))
+
+    _register(as_json)
+    return fn
 
 # --------------------------------------------------------------------------
 # helpers
@@ -53,6 +140,24 @@ def _round(value: Any, digits: int = 2) -> Any:
     return round(value, digits) if isinstance(value, (int, float)) else value
 
 
+def _first(raw: dict[str, Any], *keys: str) -> Any:
+    """First value among ``keys`` that is present (Garmin names the same metric differently per endpoint)."""
+    return next((raw[k] for k in keys if raw.get(k) is not None), None)
+
+
+def _flatten_detail(raw: dict[str, Any]) -> dict[str, Any]:
+    """Give a single-activity payload the flat shape the list endpoints return.
+
+    ``get_activity`` nests the metrics under ``summaryDTO`` and the type under
+    ``activityTypeDTO``; ``_summarise_activity`` reads them from the top level.
+    """
+    flat = {k: v for k, v in raw.items() if k != "summaryDTO"}
+    flat.update(raw.get("summaryDTO") or {})
+    if "activityType" not in flat and flat.get("activityTypeDTO"):
+        flat["activityType"] = flat["activityTypeDTO"]
+    return flat
+
+
 def _summarise_activity(raw: dict[str, Any]) -> dict[str, Any]:
     """Reduce a Garmin activity record to the fields people ask about."""
     distance_m = raw.get("distance") or 0
@@ -71,9 +176,9 @@ def _summarise_activity(raw: dict[str, Any]) -> dict[str, Any]:
         "avg_hr": raw.get("averageHR"),
         "max_hr": raw.get("maxHR"),
         "elevation_gain_m": _round(raw.get("elevationGain"), 1),
-        "avg_power_w": raw.get("avgPower"),
-        "normalized_power_w": raw.get("normPower"),
-        "training_effect_aerobic": raw.get("aerobicTrainingEffect"),
+        "avg_power_w": _first(raw, "avgPower", "averagePower"),
+        "normalized_power_w": _first(raw, "normPower", "normalizedPower"),
+        "training_effect_aerobic": _first(raw, "aerobicTrainingEffect", "trainingEffect"),
         "training_effect_anaerobic": raw.get("anaerobicTrainingEffect"),
         "location": raw.get("locationName"),
     }
@@ -96,7 +201,7 @@ def _summarise_activity(raw: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-@server.tool()
+@read_tool
 def check_connection() -> dict[str, Any]:
     """Verify the stored Garmin tokens work. Returns unit system and last device."""
     garmin = connect()
@@ -107,7 +212,7 @@ def check_connection() -> dict[str, Any]:
     }
 
 
-@server.tool()
+@read_tool
 def list_activities(
     limit: int = 10,
     start: int = 0,
@@ -126,7 +231,7 @@ def list_activities(
     return [_summarise_activity(scrub(a)) for a in records]
 
 
-@server.tool()
+@read_tool
 def list_activities_by_date(
     start_date: str,
     end_date: str | None = None,
@@ -145,7 +250,7 @@ def list_activities_by_date(
     return [_summarise_activity(scrub(a)) for a in records]
 
 
-@server.tool()
+@read_tool
 def get_activity(
     activity_id: str,
     include_splits: bool = False,
@@ -163,12 +268,14 @@ def get_activity(
         include_location: Include GPS coordinates. Off by default.
     """
     garmin = connect()
-    raw = scrub(garmin.get_activity(activity_id), drop_location=not include_location)
+    raw = _flatten_detail(scrub(garmin.get_activity(activity_id), drop_location=not include_location))
     result: dict[str, Any] = {"summary": _summarise_activity(raw)}
 
     if include_location:
-        result["summary"]["start_latitude"] = raw.get("startLatitude")
-        result["summary"]["start_longitude"] = raw.get("startLongitude")
+        # Indoor activities have no GPS; leave the keys out rather than send nulls.
+        for key, source in (("start_latitude", "startLatitude"), ("start_longitude", "startLongitude")):
+            if raw.get(source) is not None:
+                result["summary"][key] = raw[source]
     if include_splits:
         result["splits"] = scrub(
             garmin.get_activity_splits(activity_id), drop_location=not include_location
@@ -181,7 +288,7 @@ def get_activity(
     return result
 
 
-@server.tool()
+@read_tool
 def daily_summary(day: str | None = None) -> dict[str, Any]:
     """Headline health numbers for one day: steps, resting HR, stress, body battery, sleep."""
     cdate = _day(day)
@@ -206,7 +313,7 @@ def daily_summary(day: str | None = None) -> dict[str, Any]:
     }
 
 
-@server.tool()
+@read_tool
 def get_sleep(day: str | None = None) -> dict[str, Any]:
     """Sleep breakdown for one night: score, stages, and restlessness."""
     cdate = _day(day)
@@ -228,7 +335,7 @@ def get_sleep(day: str | None = None) -> dict[str, Any]:
     }
 
 
-@server.tool()
+@read_tool
 def get_hrv(day: str | None = None) -> dict[str, Any]:
     """Overnight heart-rate variability summary and baseline status."""
     cdate = _day(day)
@@ -243,37 +350,38 @@ def get_hrv(day: str | None = None) -> dict[str, Any]:
     }
 
 
-@server.tool()
+@read_tool
 def get_training_readiness(day: str | None = None) -> list[dict[str, Any]]:
     """Training readiness score and the factors feeding it."""
     data = connect().get_training_readiness(_day(day)) or []
     return scrub(data)
 
 
-@server.tool()
+@read_tool
 def get_training_status(day: str | None = None) -> dict[str, Any]:
     """Training status, acute load, and VO2 max."""
     return scrub(connect().get_training_status(_day(day)) or {})
 
 
-@server.tool()
+@read_tool
 def get_body_composition(start_date: str, end_date: str | None = None) -> dict[str, Any]:
     """Weight and body-composition measurements over a date range."""
     return scrub(connect().get_body_composition(_day(start_date), _day(end_date)) or {})
 
 
-@server.tool()
+@read_tool
 def get_steps_range(start_date: str, end_date: str | None = None) -> list[dict[str, Any]]:
     """Daily step totals across a date range, for trend questions."""
     return scrub(connect().get_daily_steps(_day(start_date), _day(end_date)) or [])
 
 
-@server.tool()
+@read_tool
 def call_readonly(method: str, params: dict[str, Any] | None = None) -> Any:
     """Escape hatch for Garmin endpoints without a dedicated tool.
 
     Only `get_*` methods are reachable, so this cannot upload, modify or delete
-    anything. Use the dedicated tools first - their output is far more compact.
+    anything. Use the dedicated tools first - their output is far more compact. A result
+    over 100 KB comes back as a short truncation notice: ask for less.
 
     Args:
         method: A garminconnect method name, e.g. "get_personal_record".

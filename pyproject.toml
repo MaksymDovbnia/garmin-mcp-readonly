@@ -1,13 +1,16 @@
 [project]
 name = "garmin-mcp"
 version = "0.1.0"
-description = "MCP server exposing your own Garmin Connect data to Claude, using token-only auth."
+description = "Read-only MCP server exposing your own Garmin Connect data to AI assistants, using token-only auth."
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "mcp>=2.2,<3",
     "garminconnect==0.3.16",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [project.scripts]
 garmin-mcp = "garmin_mcp.server:main"

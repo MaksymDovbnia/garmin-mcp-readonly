@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Proposes updates to uv.lock. A garminconnect bump is gated by the tests that check
+  # its get_* methods still never write (tests/test_safety.py).
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly

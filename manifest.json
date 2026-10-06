@@ -4,15 +4,15 @@
   "display_name": "Garmin Connect (local)",
   "version": "0.1.0",
   "description": "Read your own Garmin Connect training and health data. Token-only auth, no password handling.",
-  "long_description": "Runs from a local checkout you control rather than resolving an unpinned git branch at launch. Authentication is token-only: run `garmin-mcp-auth` once in a terminal to mint OAuth tokens. The server has no code path that accepts a password. Responses are summarised and stripped of account identifiers and GPS coordinates before reaching the model.",
+  "long_description": "Runs from a local checkout you control, over stdio, and talks only to Garmin. Authentication is token-only: run `garmin-mcp-auth` once in a terminal to mint OAuth tokens. The server has no code path that accepts a password. Responses are summarised and stripped of known account identifiers and GPS coordinates before reaching the model. Unofficial: not affiliated with Garmin.",
   "author": { "name": "maksymdovbnia" },
   "license": "MIT",
   "keywords": ["garmin", "fitness", "health", "training"],
   "server": {
     "type": "python",
-    "entry_point": "garmin_mcp",
+    "entry_point": "src/garmin_mcp/server.py",
     "mcp_config": {
-      "command": "${HOME}/dev/garmin-mcp/.venv/bin/garmin-mcp",
+      "command": "${user_config.server_path}",
       "args": [],
       "env": {
         "GARMINTOKENS": "${user_config.token_path}"
@@ -20,6 +20,12 @@
     }
   },
   "user_config": {
+    "server_path": {
+      "type": "file",
+      "title": "garmin-mcp executable",
+      "description": "Absolute path to the garmin-mcp executable inside your virtualenv, e.g. <repo>/.venv/bin/garmin-mcp. Install the project first (see README).",
+      "required": true
+    },
     "token_path": {
       "type": "directory",
       "title": "Token storage directory",
@@ -30,6 +36,6 @@
   },
   "compatibility": {
     "claude_desktop": ">=0.10.0",
-    "platforms": ["darwin", "linux", "win32"]
+    "platforms": ["darwin"]
   }
 }
