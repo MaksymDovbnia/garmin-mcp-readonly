@@ -5,7 +5,7 @@ description = "Read-only MCP server exposing your own Garmin Connect data to AI 
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
-    "mcp>=2.2,<3",
+    "mcp>=2.3.0,<3",
     "garminconnect==0.3.16",
 ]
 
